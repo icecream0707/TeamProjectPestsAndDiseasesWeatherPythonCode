@@ -3,7 +3,7 @@
 매일 02:10, 05:10, 08:10, 11:10, 14:10, 17:10, 20:10, 23:10 (KST)에 실행:
   - 초단기실황(getUltraSrtNcst): 지난 3시간(정시 3개)을 격자별로 받아 weather_hourly에 INSERT IGNORE
   - 단기예보(getVilageFcst): 방금 발표된 회차(02:10이면 0200 발표)를 격자별로 받아, 앞 24시간만 weather_forecast에 덮어씀
-  - 위험 판단(disease_risk.py): 위 두 저장과 같은 트랜잭션에서 disease_risk를 덮어씀
+  - 위험 판단(disease_risk.py): 위 두 저장과 같은 트랜잭션에서 disease_risk(risk_level, in_season)를 덮어씀
 격자는 region_grid의 DISTINCT (nx, ny).
 
 필요: pip install requests pymysql
@@ -70,16 +70,16 @@ def to_int(raw):
     return None if v is None else int(v)
 
 
-def pcp_value(raw):
-    """단기예보 PCP는 범주 문자열(예: '1mm 미만', '6.2mm', '30.0~50.0mm', '강수없음')이라 그대로 저장.
-    숫자로 온 Missing 값만 None으로 바꿈."""
-    if raw is None:
-        return None
-    try:
-        v = float(raw)
-    except ValueError:
-        return str(raw)
-    return None if v >= 900 or v <= -900 else str(raw)
+def pcp_to_rn1(raw):
+    """단기예보 PCP 범주 문자열 → 1시간 강수량(mm). 범주는 활용가이드 표의 아래쪽 경계값으로:
+    '강수없음'·'-'·null·0 → 0, '1mm 미만'(0.1~1.0mm 미만) → 0.1, '6.2mm' → 6.2,
+    '30.0~50.0mm' → 30.0, '50.0mm 이상' → 50.0. Missing 값과 모르는 형식 → None."""
+    s = "" if raw is None else str(raw).strip()
+    if s in ("", "-", "강수없음"):
+        return 0.0
+    if "미만" in s:
+        return 0.1
+    return to_number(s.replace("mm", "").replace("이상", "").split("~")[0])
 
 
 def pivot_ncst(items):
@@ -101,19 +101,19 @@ def pivot_ncst(items):
 
 
 def pivot_fcst(items):
-    """단기예보 item 목록 → {forecast_at: {t1h, pcp, reh, pty}} (TMP는 t1h 컬럼에 저장)"""
+    """단기예보 item 목록 → {forecast_at: {t1h, rn1, reh, pty}} (TMP는 t1h, PCP는 숫자로 바꿔 rn1 컬럼에 저장)"""
     rows = {}
     for it in items:
         cat = it["category"]
         if cat not in ("TMP", "PCP", "REH", "PTY"):
             continue  # TMN, TMX, SKY, POP, 바람 등은 저장하지 않음
         at = datetime.strptime(it["fcstDate"] + it["fcstTime"], "%Y%m%d%H%M")
-        row = rows.setdefault(at, {"t1h": None, "pcp": None, "reh": None, "pty": None})
+        row = rows.setdefault(at, {"t1h": None, "rn1": None, "reh": None, "pty": None})
         val = it["fcstValue"]
         if cat == "TMP":
             row["t1h"] = to_number(val)
         elif cat == "PCP":
-            row["pcp"] = pcp_value(val)
+            row["rn1"] = pcp_to_rn1(val)
         elif cat == "REH":
             row["reh"] = to_int(val)
         elif cat == "PTY":
@@ -208,9 +208,9 @@ def collect(slot):
                     if fcst:
                         cur.execute("DELETE FROM weather_forecast WHERE nx = %s AND ny = %s", (nx, ny))
                         cur.executemany(
-                            "INSERT INTO weather_forecast (nx, ny, forecast_at, t1h, pcp, reh, pty) "
+                            "INSERT INTO weather_forecast (nx, ny, forecast_at, t1h, rn1, reh, pty) "
                             "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                            [(nx, ny, at, r["t1h"], r["pcp"], r["reh"], r["pty"]) for at, r in fcst.items()])
+                            [(nx, ny, at, r["t1h"], r["rn1"], r["reh"], r["pty"]) for at, r in fcst.items()])
                         ok_f += 1
                     # 방금 넣은 행 + 이전 23시간 실황 + 24시간 예보로 판단 (같은 트랜잭션이라 새 행도 보임)
                     disease_risk.update_grid(cur, nx, ny, fcst_base, ids)
